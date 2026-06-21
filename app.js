@@ -1,1366 +1,546 @@
-/* =========================================================
-   Métabolyse — application logic v2
-   Password: root
-   Cloud sync: JSONBin.io (optional)
-   ========================================================= */
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Métabolyse — Suivi nutrition &amp; métabolisme</title>
+<meta name="description" content="Suivi intelligent de la nutrition, du déficit calorique et de l'adaptation métabolique." />
+<meta name="theme-color" content="#0E1310" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js" onerror="this.onerror=null;document.write('<script src=\'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js\'>\x3c/script>')"></script>
+</head>
+<body>
 
-const PASSWORD = 'root';
-const STORAGE_KEY = 'metabolyse:data:v2';
-const THEME_KEY   = 'metabolyse:theme';
-const AUTH_KEY    = 'metabolyse:auth';
-
-/* =========================================================
-   STORE — local + optional cloud sync via JSONBin.io
-   ========================================================= */
-const Store = {
-  load(){
-    try{ const r=localStorage.getItem(STORAGE_KEY); return r?JSON.parse(r):null; }
-    catch(e){ return null; }
-  },
-  save(data){ localStorage.setItem(STORAGE_KEY,JSON.stringify(data)); },
-  init(){
-    return { profile:null, logs:{}, goals:{}, journal:[] };
-  },
-  async push(data){
-    const p = data.profile;
-    if(!p?.jsonbinKey || !p?.jsonbinId) return false;
-    try{
-      const r = await fetch(`https://api.jsonbin.io/v3/b/${p.jsonbinId}`,{
-        method:'PUT',
-        headers:{'Content-Type':'application/json','X-Master-Key':p.jsonbinKey},
-        body: JSON.stringify(data)
-      });
-      return r.ok;
-    }catch(e){ return false; }
-  },
-  async pull(key, id){
-    try{
-      const r = await fetch(`https://api.jsonbin.io/v3/b/${id}/latest`,{
-        headers:{'X-Master-Key':key}
-      });
-      if(!r.ok) return null;
-      const j = await r.json();
-      return j.record || null;
-    }catch(e){ return null; }
-  }
-};
-
-let DB = Store.load() || Store.init();
-function persist(){
-  Store.save(DB);
-  const p=DB.profile;
-  if(!p?.jsonbinKey || !p?.jsonbinId) return;
-  // Pull the latest remote state first and merge it in, so pushing never erases
-  // entries that exist only on the other device but haven't been pulled here yet.
-  Store.pull(p.jsonbinKey,p.jsonbinId).then(remote=>{
-    if(remote?.logs) mergeRemoteLogs(remote.logs);
-    Store.save(DB);
-    return Store.push(DB);
-  }).then(ok=>{
-    if(ok) showToast('✓ Données synchronisées');
-  });
-}
-
-// Merge remote logs into DB.logs, keeping whichever version of each day is most recent.
-// Entries without an updatedAt timestamp are treated as old/legacy and lose to any timestamped entry.
-function mergeRemoteLogs(remoteLogs){
-  if(!remoteLogs) return false;
-  let changed=false;
-  Object.keys(remoteLogs).forEach(date=>{
-    const remote=remoteLogs[date];
-    const local=DB.logs[date];
-    if(!local){ DB.logs[date]=remote; changed=true; return; }
-    const localTs=local.updatedAt||0;
-    const remoteTs=remote.updatedAt||0;
-    if(remoteTs>localTs){ DB.logs[date]=remote; changed=true; }
-  });
-  return changed;
-}
-
-/* =========================================================
-   DATE HELPERS
-   ========================================================= */
-const todayISO = () => new Date().toISOString().slice(0,10);
-const addDays  = (iso,n) => { const d=new Date(iso); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); };
-const daysBetween = (a,b) => Math.round((new Date(b)-new Date(a))/86400000);
-const fmt1 = n => (n==null||isNaN(n)) ? '—' : n.toFixed(1);
-const fmt0 = n => (n==null||isNaN(n)) ? '—' : Math.round(n).toString();
-const fmtDate = iso => new Date(iso).toLocaleDateString('fr-FR',{day:'numeric',month:'short',year:'numeric'});
-
-function age(birthdate){
-  const b=new Date(birthdate), n=new Date();
-  let a=n.getFullYear()-b.getFullYear();
-  if(n.getMonth()<b.getMonth()||(n.getMonth()===b.getMonth()&&n.getDate()<b.getDate())) a--;
-  return a;
-}
-
-/* =========================================================
-   METABOLISM CALCULATIONS
-   ========================================================= */
-function mifflinStJeor({sex,weight,height,ageYears}){
-  const base = 10*weight + 6.25*height - 5*ageYears;
-  return sex==='male' ? base+5 : base-161;
-}
-function katchMcArdle({weight,bodyfatPct}){
-  const lm = weight*(1-bodyfatPct/100);
-  return 370 + 21.6*lm;
-}
-
-// Adjust BMR from manual base using weight/body-composition evolution
-function computeCurrentBMR(profile, currentWeight, currentBodyfat){
-  const baseBMR = profile.baseBMR || 1800;
-  // scale by weight relative to start weight
-  const startW = profile.startWeight || profile.weight || currentWeight;
-  if(startW <= 0) return baseBMR;
-  // Use Mifflin-St Jeor to derive scaling factor from weight change
-  const mStart = mifflinStJeor({sex:profile.sex,weight:startW,height:profile.height,ageYears:age(profile.birthdate)});
-  const mNow   = mifflinStJeor({sex:profile.sex,weight:currentWeight,height:profile.height,ageYears:age(profile.birthdate)});
-  let bmr = baseBMR * (mNow / (mStart||1));
-  // Refine with Katch-McArdle if we have body-fat
-  if(currentBodyfat && currentBodyfat > 0 && currentBodyfat < 60){
-    const katch = katchMcArdle({weight:currentWeight, bodyfatPct:currentBodyfat});
-    bmr = bmr*0.4 + katch*0.6;
-  }
-  return Math.round(bmr);
-}
-
-function getLogsSorted(){
-  return Object.values(DB.logs).sort((a,b)=>a.date<b.date?-1:1);
-}
-function getLatestField(field,before){
-  const logs=getLogsSorted().filter(l=>l[field]!=null&&(!before||l.date<=before));
-  return logs.length ? logs[logs.length-1][field] : null;
-}
-function estimateBodyfat(date){
-  // linear interpolation between known values
-  const all = getLogsSorted().filter(l=>l.bodyfat!=null);
-  if(!all.length) return DB.profile?.bodyfat || null;
-  const before = all.filter(l=>l.date<=date);
-  const after  = all.filter(l=>l.date> date);
-  if(!before.length) return after[0].bodyfat;
-  if(!after.length)  return before[before.length-1].bodyfat;
-  const b=before[before.length-1], a=after[0];
-  const span = daysBetween(b.date,a.date)||1;
-  const t    = daysBetween(b.date,date)/span;
-  return b.bodyfat + t*(a.bodyfat - b.bodyfat);
-}
-function estimateMuscle(date){
-  const all = getLogsSorted().filter(l=>l.muscle!=null);
-  if(!all.length) return DB.profile?.muscle || null;
-  const before = all.filter(l=>l.date<=date);
-  const after  = all.filter(l=>l.date> date);
-  if(!before.length) return after[0].muscle;
-  if(!after.length)  return before[before.length-1].muscle;
-  const b=before[before.length-1], a=after[0];
-  const span=daysBetween(b.date,a.date)||1;
-  const t=daysBetween(b.date,date)/span;
-  return b.muscle + t*(a.muscle - b.muscle);
-}
-
-// Adaptive BMR: infer from weight change vs declared intake
-function computeAdaptiveBMR(profile){
-  const logs = getLogsSorted().filter(l=>l.calories!=null);
-  const wNow  = getLatestField('weight') ?? profile.weight;
-  const bfNow = getLatestField('bodyfat') ?? profile.bodyfat;
-  const theoBMR = computeCurrentBMR(profile, wNow, bfNow);
-  if(logs.length < 10) return {theoretical:theoBMR, adapted:theoBMR, gap:0};
-  const win = logs.slice(-21);
-  const firstW = getLatestField('weight',win[0].date) ?? profile.weight;
-  const lastW  = getLatestField('weight',win[win.length-1].date) ?? firstW;
-  const days   = daysBetween(win[0].date,win[win.length-1].date)||1;
-  const wDelta = lastW-firstW;
-  const impliedBalance = (wDelta*7700)/days;
-  const avgIntake = win.reduce((s,l)=>s+l.calories,0)/win.length;
-  const actualTDEE = avgIntake - impliedBalance;
-  // TDEE = BMR * 1 (we store sport separately) — no activity factor needed
-  const adaptedBMR = actualTDEE;
-  const blended = theoBMR*0.45 + adaptedBMR*0.55;
-  const clamped = Math.max(theoBMR*0.75, Math.min(theoBMR*1.1, blended));
-  return {theoretical:Math.round(theoBMR), adapted:Math.round(clamped), gap:Math.round(clamped-theoBMR)};
-}
-
-// Get total sport calories for a log entry
-function getSportKcal(log){
-  if(!log?.sports?.length) return 0;
-  return log.sports.reduce((s,a)=>s+(parseFloat(a.kcal)||0),0);
-}
-
-// TDEE = adaptive BMR + sport burned today
-function getTDEE(adaptedBMR, sportKcal){
-  return Math.round(adaptedBMR + sportKcal);
-}
-
-/* =========================================================
-   SERIES BUILDERS
-   ========================================================= */
-function buildWeightSeries(){
-  return getLogsSorted().filter(l=>l.weight!=null).map(l=>({date:l.date,value:l.weight}));
-}
-function buildSeries(field){
-  return getLogsSorted().filter(l=>l[field]!=null).map(l=>({date:l.date,value:l[field]}));
-}
-function buildCompositionKg(){
-  // return {date, fat, muscle, lean} series with estimation for missing days
-  return getLogsSorted().filter(l=>l.weight!=null).map(l=>{
-    const w  = l.weight;
-    const bf = l.bodyfat ?? estimateBodyfat(l.date) ?? 0;
-    const mm = l.muscle  ?? estimateMuscle(l.date)  ?? 0;
-    return {
-      date: l.date,
-      fat:   parseFloat((w*bf/100).toFixed(2)),
-      muscle:parseFloat((w*mm/100).toFixed(2)),
-      lean:  parseFloat((w*(1-bf/100)).toFixed(2))
-    };
-  });
-}
-function movingAverage(series,w){
-  return series.map((pt,i)=>{
-    const sl=series.slice(Math.max(0,i-w+1),i+1).filter(p=>p.value!=null);
-    return {date:pt.date, value:sl.length?sl.reduce((s,p)=>s+p.value,0)/sl.length:null};
-  });
-}
-
-/* =========================================================
-   DEFICIT / BALANCE
-   ========================================================= */
-function dailyBalance(log, adaptedBMR){
-  if(!log||log.calories==null) return null;
-  const sport = getSportKcal(log);
-  const tdee  = getTDEE(adaptedBMR, sport);
-  return log.calories - tdee;
-}
-function statusFromBalance(b){
-  if(b===null) return 'unknown';
-  if(b<=-400)  return 'deficit-strong';
-  if(b<=-100)  return 'deficit-light';
-  if(b<150)    return 'maintenance';
-  if(b<500)    return 'surplus-light';
-  return 'surplus-strong';
-}
-const STATUS_LABEL={
-  'deficit-strong':'Déficit optimal','deficit-light':'Déficit léger',
-  'maintenance':'Maintenance','surplus-light':'Surplus léger',
-  'surplus-strong':'Surplus important','unknown':'Pas de donnée'
-};
-
-/* =========================================================
-   SCORES
-   ========================================================= */
-function computeScores(){
-  const bf=buildSeries('bodyfat'), mm=buildSeries('muscle'), w=buildWeightSeries();
-  if(w.length<2) return {fle:null,mps:null};
-  const wLoss=w[0].value-w[w.length-1].value;
-  let fle=null, mps=null;
-  if(bf.length>=2){
-    const bfDrop=bf[0].value-bf[bf.length-1].value;
-    fle=Math.max(0,Math.min(100,Math.round((bfDrop/(wLoss||1))*40+50)));
-  }
-  if(mm.length>=2){
-    const mmD=mm[mm.length-1].value-mm[0].value;
-    mps=Math.max(0,Math.min(100,Math.round(70+mmD*20)));
-  }
-  return {fle,mps};
-}
-
-/* =========================================================
-   PREDICTIONS
-   ========================================================= */
-function predictWeight(daysAhead){
-  const w=buildWeightSeries();
-  if(w.length<4) return null;
-  const days=daysBetween(w[0].date,w[w.length-1].date)||1;
-  const perDay=(w[w.length-1].value-w[0].value)/days;
-  return w[w.length-1].value+perDay*daysAhead;
-}
-function estimateGoalDate(targetWeight){
-  const w=buildWeightSeries();
-  if(w.length<4||!targetWeight) return null;
-  const days=daysBetween(w[0].date,w[w.length-1].date)||1;
-  const perDay=(w[w.length-1].value-w[0].value)/days;
-  if(perDay>=0) return null; // gaining weight
-  const remaining=w[w.length-1].value-targetWeight;
-  if(remaining<=0) return 'Objectif atteint !';
-  const daysNeeded=Math.ceil(remaining/Math.abs(perDay));
-  return fmtDate(addDays(todayISO(),daysNeeded));
-}
-
-/* =========================================================
-   INSIGHTS ENGINE
-   ========================================================= */
-function generateInsights(profile){
-  const ins=[];
-  const w=buildWeightSeries();
-  const logs=getLogsSorted();
-  const {adapted}=computeAdaptiveBMR(profile);
-  if(w.length>=2){
-    const days=daysBetween(w[0].date,w[w.length-1].date)||1;
-    const perWk=(w[0].value-w[w.length-1].value)/days*7;
-    if(Math.abs(perWk)>0.05)
-      ins.push(`Tu ${perWk>0?'perds':'prends'} en moyenne ${Math.abs(perWk).toFixed(2)} kg/semaine.`);
-  }
-  const wCal=logs.filter(l=>l.calories!=null);
-  if(wCal.length>=5){
-    const tdeeBase=getTDEE(adapted,0);
-    const avg14=wCal.slice(-14);
-    const avgIntake=avg14.reduce((s,l)=>s+l.calories,0)/avg14.length;
-    const avgSport=avg14.reduce((s,l)=>s+getSportKcal(l),0)/avg14.length;
-    const avgDef=tdeeBase+avgSport-avgIntake;
-    if(Math.abs(avgDef)>30)
-      ins.push(`Ton ${avgDef>0?'déficit':'surplus'} moyen (14j) est de ${Math.abs(Math.round(avgDef))} kcal/j (sport inclus).`);
-  }
-  const {theoretical,adapted:adBMR}=computeAdaptiveBMR(profile);
-  if(theoretical>0){
-    const pct=Math.round(((adBMR-theoretical)/theoretical)*100);
-    if(pct<=-3) ins.push(`Ton métabolisme semble avoir ralenti de ${Math.abs(pct)}% — envisage un repas de recharge.`);
-    if(pct>=3)  ins.push(`Ton métabolisme semble s'être accéléré de ${pct}%.`);
-  }
-  // plateau
-  if(w.length>=14){
-    const r=w.slice(-14);
-    const span=Math.max(...r.map(p=>p.value))-Math.min(...r.map(p=>p.value));
-    if(span<0.4&&wCal.slice(-14).length>=10)
-      ins.push('Ton poids stagne depuis 14 jours malgré un déficit déclaré : possible plateau ou rétention d\'eau.');
-  }
-  // sleep warning
-  const recentSleep=logs.filter(l=>l.sleepDuration!=null).slice(-7);
-  if(recentSleep.length>=3){
-    const avg=recentSleep.reduce((s,l)=>s+l.sleepDuration,0)/recentSleep.length;
-    if(avg<6.5) ins.push(`Ton sommeil moyen est de ${avg.toFixed(1)}h sur 7 jours — un manque de sommeil peut freiner la perte de graisse.`);
-  }
-  // goal ETA
-  if(DB.goals.targetWeight&&w.length>=4){
-    const eta=estimateGoalDate(DB.goals.targetWeight);
-    if(eta&&eta!=='Objectif atteint !') ins.push(`À ton rythme actuel, tu atteindras ton objectif poids aux alentours du ${eta}.`);
-    if(eta==='Objectif atteint !') ins.push('🎉 Objectif de poids atteint !');
-  }
-  if(!ins.length) ins.push('Continue à renseigner tes données quotidiennes pour débloquer des analyses personnalisées.');
-  return ins;
-}
-
-/* =========================================================
-   BADGES
-   ========================================================= */
-function computeBadges(){
-  const w=buildWeightSeries();
-  const logs=getLogsSorted();
-  const wLost=w.length>=2 ? w[0].value-w[w.length-1].value : 0;
-  const nDays=logs.filter(l=>l.calories!=null).length;
-  const bf=buildSeries('bodyfat');
-  const bfLost=bf.length>=2 ? bf[0].value-bf[bf.length-1].value : 0;
-  const mm=buildSeries('muscle');
-  const mmGain=mm.length>=2 ? mm[mm.length-1].value-mm[0].value : 0;
-  const streak=computeStreakDays();
-  const sportDays=countSportDays();
-
-  return [
-    {group:'Constance', items:[
-      {icon:'🏅',name:'Premier pas', desc:'1ère saisie',  earned:nDays>=1},
-      {icon:'📅',name:'7 jours',     desc:'7 jours de suivi', earned:nDays>=7},
-      {icon:'🗓️',name:'1 mois',      desc:'30 jours de suivi', earned:nDays>=30},
-      {icon:'📈',name:'3 mois',      desc:'90 jours de suivi', earned:nDays>=90},
-      {icon:'🧭',name:'6 mois',      desc:'180 jours de suivi', earned:nDays>=180},
-    ]},
-    {group:'Poids perdu', items:[
-      {icon:'🔥',name:'-1 kg',  desc:'1 kg perdu',  earned:wLost>=1},
-      {icon:'💪',name:'-5 kg',  desc:'5 kg perdus', earned:wLost>=5},
-      {icon:'🏆',name:'-10 kg', desc:'10 kg perdus',earned:wLost>=10},
-      {icon:'🚀',name:'-15 kg', desc:'15 kg perdus',earned:wLost>=15},
-      {icon:'👑',name:'-20 kg', desc:'20 kg perdus',earned:wLost>=20},
-    ]},
-    {group:'Composition corporelle', items:[
-      {icon:'📉',name:'Graisse -1%', desc:'1% de masse grasse perdue', earned:bfLost>=1},
-      {icon:'📉',name:'Graisse -3%', desc:'3% de masse grasse perdue', earned:bfLost>=3},
-      {icon:'📉',name:'Graisse -5%', desc:'5% de masse grasse perdue', earned:bfLost>=5},
-      {icon:'🦾',name:'Muscle +1%',  desc:'1% de masse musculaire gagnée', earned:mmGain>=1},
-      {icon:'🦾',name:'Muscle +2%',  desc:'2% de masse musculaire gagnée', earned:mmGain>=2},
-    ]},
-    {group:'Discipline', items:[
-      {icon:'🎯',name:'Déficit 7j',  desc:'7 jours de déficit consécutifs',  earned:streak>=7},
-      {icon:'🎯',name:'Déficit 14j', desc:'14 jours de déficit consécutifs', earned:streak>=14},
-      {icon:'🎯',name:'Déficit 30j', desc:'30 jours de déficit consécutifs', earned:streak>=30},
-    ]},
-    {group:'Sport', items:[
-      {icon:'⚡',name:'Sport ×5',  desc:'5 séances sportives',  earned:sportDays>=5},
-      {icon:'⚡',name:'Sport ×20', desc:'20 séances sportives', earned:sportDays>=20},
-      {icon:'⚡',name:'Sport ×50', desc:'50 séances sportives', earned:sportDays>=50},
-    ]},
-  ];
-}
-function computeStreakDays(){
-  const {adapted}=computeAdaptiveBMR(DB.profile);
-  const logs=getLogsSorted().filter(l=>l.calories!=null);
-  let streak=0, max=0;
-  logs.forEach(l=>{
-    const b=dailyBalance(l,adapted);
-    if(b!=null&&b<0){ streak++; max=Math.max(max,streak); }
-    else streak=0;
-  });
-  return max;
-}
-function countSportDays(){
-  return getLogsSorted().filter(l=>l.sports&&l.sports.length>0).length;
-}
-
-/* =========================================================
-   RENDERING HELPERS
-   ========================================================= */
-const $ = s => document.querySelector(s);
-const $$ = s => document.querySelectorAll(s);
-
-function showToast(msg){
-  let t=$('#sync-toast');
-  if(!t){
-    t=document.createElement('div');
-    t.id='sync-toast';
-    t.className='sync-toast';
-    document.body.appendChild(t);
-  }
-  t.textContent=msg;
-  t.classList.remove('hidden');
-  clearTimeout(t._timer);
-  t._timer=setTimeout(()=>t.classList.add('hidden'),2500);
-}
-
-/* =========================================================
-   RENDER — DASHBOARD
-   ========================================================= */
-function renderWelcome(){
-  const hour=new Date().getHours();
-  const greet = hour<6?'Bonsoir':hour<12?'Bonjour':hour<18?'Bonjour':'Bonsoir';
-  const wEl=$('#welcome-greeting');
-  if(wEl) wEl.textContent=`${greet}, Mathéo 👋`;
-  const subEl=$('#welcome-sub');
-  if(subEl){
-    const log=DB.logs[todayISO()];
-    subEl.textContent = log?.calories!=null
-      ? 'Ta saisie du jour est enregistrée — continue comme ça !'
-      : "Pense à faire ta saisie du jour pour garder ton suivi à jour.";
-  }
-}
-
-function renderDashboard(){
-  const p=DB.profile;
-  if(!p) return;
-  renderWelcome();
-  const today=todayISO();
-  const log=DB.logs[today];
-  const wNow  = getLatestField('weight')  ?? p.weight;
-  const bfNow = getLatestField('bodyfat') ?? p.bodyfat;
-  const {adapted}=computeAdaptiveBMR(p);
-  const sportNow=getSportKcal(log);
-  const tdee=getTDEE(adapted,sportNow);
-
-  // BMR cards
-  $('#bmr-manual').textContent = fmt0(p.baseBMR)+' kcal';
-  $('#bmr-adapt').textContent  = fmt0(adapted)+' kcal';
-  $('#tdee-total').textContent = fmt0(tdee)+' kcal';
-
-  // Calories
-  const consumed=log?.calories??0;
-  $('#cal-consumed').textContent=fmt0(consumed);
-  $('#cal-target').textContent=fmt0(tdee);
-  const pct=tdee?Math.min(100,Math.round((consumed/tdee)*100)):0;
-  $('#cal-progress').style.width=pct+'%';
-  $('#cal-remaining').textContent=fmt0(tdee-consumed)+' kcal';
-  $('#cal-sport-today').textContent=fmt0(sportNow);
-
-  // Deficit
-  const bal=dailyBalance(log,adapted);
-  const status=statusFromBalance(bal);
-  $('#deficit-day').textContent=bal!=null?(bal>0?'+':'')+fmt0(bal)+' kcal':'—';
-  const chip=$('#deficit-status');
-  chip.textContent=STATUS_LABEL[status];
-  chip.className='status-chip '+(status.startsWith('deficit')?'ok':status==='maintenance'?'warn':status.startsWith('surplus')?'bad':'');
-
-  const logs=getLogsSorted();
-  const dNow=today;
-  const wkLogs=logs.filter(l=>l.calories!=null&&daysBetween(l.date,dNow)<=7);
-  const moLogs=logs.filter(l=>l.calories!=null&&daysBetween(l.date,dNow)<=30);
-  const avgBal=arr=>arr.length?arr.reduce((s,l)=>s+(l.calories-getTDEE(adapted,getSportKcal(l))),0)/arr.length:null;
-  const wb=avgBal(wkLogs), mb=avgBal(moLogs);
-  $('#deficit-week').textContent=wb!=null?(wb>0?'+':'')+fmt0(wb)+' kcal':'—';
-  $('#deficit-month').textContent=mb!=null?(mb>0?'+':'')+fmt0(mb)+' kcal':'—';
-
-  // Weight
-  $('#weight-current').textContent=fmt1(wNow);
-  const w7=getLatestField('weight',addDays(today,-7));
-  const w30=getLatestField('weight',addDays(today,-30));
-  $('#weight-week').textContent=w7!=null?((wNow-w7)>=0?'+':'')+fmt1(wNow-w7)+' kg':'—';
-  $('#weight-month').textContent=w30!=null?((wNow-w30)>=0?'+':'')+fmt1(wNow-w30)+' kg':'—';
-
-  // Composition
-  const mmNow=getLatestField('muscle')??p.muscle;
-  const bfKg=bfNow!=null&&wNow?(wNow*bfNow/100):null;
-  const mmKg=mmNow!=null&&wNow?(wNow*mmNow/100):null;
-  const leanKg=bfKg!=null&&wNow?(wNow-bfKg):null;
-  $('#bf-pct').textContent=fmt1(bfNow)+'%';
-  $('#bf-kg').textContent=bfKg!=null?fmt1(bfKg)+' kg':'';
-  $('#mm-pct').textContent=fmt1(mmNow)+'%';
-  $('#mm-kg').textContent=mmKg!=null?fmt1(mmKg)+' kg':'';
-  $('#lean-kg').textContent=leanKg!=null?fmt1(leanKg)+' kg':'—';
-  // % of weight loss from fat
-  const wSeries=buildWeightSeries();
-  const bfSeries=buildSeries('bodyfat');
-  if(wSeries.length>=2&&bfSeries.length>=2){
-    const wDelta=wSeries[0].value-wSeries[wSeries.length-1].value;
-    const bfKgStart=wSeries[0].value*bfSeries[0].value/100;
-    const bfKgEnd  =wNow*(bfNow??bfSeries[bfSeries.length-1].value)/100;
-    const fatLost  =bfKgStart-bfKgEnd;
-    const pctFat   =wDelta>0?Math.round((fatLost/wDelta)*100):null;
-    $('#fat-loss-pct').textContent=pctFat!=null?pctFat+'%':'—';
-  } else { $('#fat-loss-pct').textContent='—'; }
-
-  // Scores
-  const sc=computeScores();
-  $('#score-fle').textContent=sc.fle!=null?sc.fle+'/100':'—';
-  $('#score-mps').textContent=sc.mps!=null?sc.mps+'/100':'—';
-
-  // Sleep last night
-  const slLog=getLogsSorted().filter(l=>l.sleepDuration!=null||l.sleepScore!=null).reverse()[0];
-  if(slLog){
-    const parts=[];
-    if(slLog.sleepDuration) parts.push(slLog.sleepDuration+'h');
-    if(slLog.sleepScore)    parts.push('score '+slLog.sleepScore);
-    $('#sleep-dash').textContent=parts.join(' · ');
-  }
-
-  // Insights
-  const insights=generateInsights(p);
-  $('#top-insight').textContent=insights[0];
-  $('#insights-list').innerHTML=insights.map(i=>`<li>${i}</li>`).join('');
-}
-
-/* =========================================================
-   RENDER — CHARTS
-   ========================================================= */
-let charts={};
-function destroyCharts(){ Object.values(charts).forEach(c=>c?.destroy()); charts={}; }
-function chartTheme(){
-  const dark=document.documentElement.dataset.theme==='dark';
-  return {
-    grid:dark?'rgba(255,255,255,0.06)':'rgba(0,0,0,0.06)',
-    text:dark?'#9AA8A0':'#5B6660',
-    accent:dark?'#3FCB91':'#1F7A5C',
-    bad:dark?'#E1645A':'#C0463B',
-    warn:dark?'#E0A458':'#C97A2B'
-  };
-}
-function baseOpts(theme){
-  return {
-    responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{labels:{color:theme.text,font:{size:11}}}},
-    scales:{
-      x:{ticks:{color:theme.text,maxTicksLimit:8},grid:{color:theme.grid}},
-      y:{ticks:{color:theme.text},grid:{color:theme.grid}}
-    }
-  };
-}
-
-function renderCharts(){
-  destroyCharts();
-  const theme=chartTheme();
-
-  // Weight
-  const wS=buildWeightSeries();
-  const ma7=movingAverage(wS,7), ma30=movingAverage(wS,30);
-  if($('#chart-weight')){
-    charts.weight=new Chart($('#chart-weight'),{
-      type:'line',
-      data:{labels:wS.map(p=>p.date),datasets:[
-        {label:'Poids',data:wS.map(p=>p.value),borderColor:theme.text,pointRadius:2,tension:.2},
-        {label:'Moy. 7j',data:ma7.map(p=>p.value),borderColor:theme.accent,borderWidth:2,pointRadius:0,tension:.3},
-        {label:'Moy. 30j',data:ma30.map(p=>p.value),borderColor:theme.warn,borderWidth:2,pointRadius:0,tension:.3,borderDash:[4,3]},
-      ]},options:baseOpts(theme)
-    });
-  }
-
-  // Composition %
-  const bf=buildSeries('bodyfat'), mm=buildSeries('muscle');
-  if($('#chart-composition')){
-    charts.composition=new Chart($('#chart-composition'),{
-      type:'line',
-      data:{labels:bf.map(p=>p.date),datasets:[
-        {label:'Masse grasse %',data:bf.map(p=>p.value),borderColor:theme.bad,tension:.25,pointRadius:1},
-        {label:'Masse musculaire %',data:mm.map(p=>p.value),borderColor:theme.accent,tension:.25,pointRadius:1},
-      ]},options:baseOpts(theme)
-    });
-  }
-
-  // Composition kg
-  const compKg=buildCompositionKg();
-  if($('#chart-composition-kg')&&compKg.length){
-    charts.compKg=new Chart($('#chart-composition-kg'),{
-      type:'line',
-      data:{labels:compKg.map(p=>p.date),datasets:[
-        {label:'Graisse (kg)',data:compKg.map(p=>p.fat),borderColor:theme.bad,tension:.25,pointRadius:1},
-        {label:'Muscle (kg)',data:compKg.map(p=>p.muscle),borderColor:theme.accent,tension:.25,pointRadius:1},
-        {label:'Masse maigre (kg)',data:compKg.map(p=>p.lean),borderColor:theme.warn,tension:.25,pointRadius:1,borderDash:[3,3]},
-      ]},options:baseOpts(theme)
-    });
-  }
-
-  // Metabolism
-  const metaLabels=[], metaTheo=[], metaAdapt=[];
-  const p=DB.profile;
-  getLogsSorted().forEach(l=>{
-    if(!l.weight) return;
-    metaLabels.push(l.date);
-    metaTheo.push(computeCurrentBMR(p,l.weight,l.bodyfat??p.bodyfat));
-  });
-  const {adapted}=computeAdaptiveBMR(p);
-  metaLabels.forEach(()=>metaAdapt.push(adapted));
-  if($('#chart-metabolism')){
-    charts.metabolism=new Chart($('#chart-metabolism'),{
-      type:'line',
-      data:{labels:metaLabels,datasets:[
-        {label:'BMR manuel ajusté',data:metaTheo,borderColor:theme.text,tension:.2,pointRadius:1},
-        {label:'BMR adapté observé',data:metaAdapt,borderColor:theme.accent,tension:.2,pointRadius:1,borderDash:[4,3]},
-      ]},options:baseOpts(theme)
-    });
-  }
-
-  // Cumulative deficit
-  let cum=0;
-  const defLabels=[], defData=[];
-  getLogsSorted().filter(l=>l.calories!=null).forEach(l=>{
-    const sport=getSportKcal(l);
-    cum += getTDEE(adapted,sport)-l.calories;
-    defLabels.push(l.date); defData.push(cum);
-  });
-  if($('#chart-deficit')){
-    charts.deficit=new Chart($('#chart-deficit'),{
-      type:'line',
-      data:{labels:defLabels,datasets:[{label:'Déficit cumulé (kcal)',data:defData,borderColor:theme.accent,backgroundColor:theme.accent+'33',fill:true,tension:.25,pointRadius:0}]},
-      options:baseOpts(theme)
-    });
-  }
-
-  // Sleep chart
-  const sleepLogs=getLogsSorted().filter(l=>l.sleepDuration!=null||l.sleepScore!=null);
-  if($('#chart-sleep')&&sleepLogs.length){
-    charts.sleep=new Chart($('#chart-sleep'),{
-      type:'bar',
-      data:{labels:sleepLogs.map(l=>l.date),datasets:[
-        {label:'Durée (h)',data:sleepLogs.map(l=>l.sleepDuration??null),backgroundColor:theme.accent+'99',yAxisID:'y'},
-        {label:'Score',data:sleepLogs.map(l=>l.sleepScore??null),borderColor:theme.warn,type:'line',tension:.2,pointRadius:2,yAxisID:'y1'},
-      ]},
-      options:{...baseOpts(theme),scales:{
-        x:{ticks:{color:theme.text,maxTicksLimit:10},grid:{color:theme.grid}},
-        y:{ticks:{color:theme.text},grid:{color:theme.grid},title:{display:true,text:'Heures',color:theme.text}},
-        y1:{position:'right',min:0,max:100,ticks:{color:theme.warn},grid:{drawOnChartArea:false},title:{display:true,text:'Score',color:theme.warn}},
-      }}
-    });
-  }
-
-  // Predictions
-  $('#pred-30').textContent=fmt1(predictWeight(30))+' kg';
-  $('#pred-60').textContent=fmt1(predictWeight(60))+' kg';
-  $('#pred-90').textContent=fmt1(predictWeight(90))+' kg';
-  const etaDate=estimateGoalDate(DB.goals.targetWeight);
-  $('#pred-goal-date').textContent=etaDate||'—';
-
-  // Today / recent days calories chart (ingested / spent / remaining)
-  if($('#chart-today-calories')){
-    const recent=getLogsSorted().filter(l=>l.calories!=null).slice(-14);
-    const labels=recent.map(l=>fmtDate(l.date).replace(/ \d{4}$/,''));
-    const ingested=recent.map(l=>l.calories);
-    const spent=recent.map(l=>getTDEE(adapted,getSportKcal(l)));
-    const remaining=recent.map((l,i)=>Math.max(0,spent[i]-ingested[i]));
-    charts.todayCalories=new Chart($('#chart-today-calories'),{
-      type:'bar',
-      data:{labels,datasets:[
-        {label:'Ingéré',data:ingested,backgroundColor:theme.accent,borderRadius:5,maxBarThickness:28},
-        {label:'Dépensé (TDEE)',data:spent,type:'line',borderColor:theme.warn,backgroundColor:theme.warn,tension:.3,pointRadius:3,yAxisID:'y'},
-        {label:'Restant',data:remaining,backgroundColor:theme.grid==='rgba(255,255,255,0.06)'?'#9AA8A055':'#5B666055',borderRadius:5,maxBarThickness:28},
-      ]},
-      options:baseOpts(theme)
-    });
-  }
-}
-
-/* =========================================================
-   RENDER — CALENDAR
-   ========================================================= */
-let calendarMonth=new Date();
-function renderCalendar(){
-  const {adapted}=computeAdaptiveBMR(DB.profile);
-  const year=calendarMonth.getFullYear(), month=calendarMonth.getMonth();
-  $('#calendar-title').textContent=calendarMonth.toLocaleDateString('fr-FR',{month:'long',year:'numeric'});
-  const first=new Date(year,month,1);
-  const offset=(first.getDay()+6)%7;
-  const days=new Date(year,month+1,0).getDate();
-  const grid=$('#calendar-grid');
-  grid.innerHTML='';
-  for(let i=0;i<offset;i++){ const c=document.createElement('div'); c.className='cal-cell empty'; grid.appendChild(c); }
-  for(let d=1;d<=days;d++){
-    const iso=`${year}-${String(month+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-    const log=DB.logs[iso];
-    const bal=log?dailyBalance(log,adapted):null;
-    const status=statusFromBalance(bal);
-    const cell=document.createElement('div');
-    cell.className='cal-cell '+(status!=='unknown'?status:'');
-    if(iso===todayISO()) cell.classList.add('today');
-    cell.textContent=d;
-    cell.title=STATUS_LABEL[status];
-    cell.addEventListener('click',()=>showDayDetail(iso));
-    grid.appendChild(cell);
-  }
-}
-function showDayDetail(iso){
-  const log=DB.logs[iso];
-  const box=$('#day-detail');
-  box.classList.remove('hidden');
-  if(charts.dayDetail){ charts.dayDetail.destroy(); delete charts.dayDetail; }
-  if(!log){
-    box.innerHTML=`
-      <div class="day-detail-head"><span>${fmtDate(iso)}</span>
-        <button class="btn-mini" id="day-edit-btn">+ Ajouter une saisie</button>
-      </div>
-      <p class="hint">Aucune donnée enregistrée pour ce jour.</p>`;
-    $('#day-edit-btn').addEventListener('click',()=>window.openLogForDate(iso));
-    return;
-  }
-  const {adapted}=computeAdaptiveBMR(DB.profile);
-  const sport=getSportKcal(log);
-  const tdee=getTDEE(adapted,sport);
-  const bal=dailyBalance(log,adapted);
-  const consumed=log.calories??0;
-  const remaining=Math.max(0,tdee-consumed);
-  const sportHtml=log.sports?.length?`<div class="day-sport-list">${log.sports.map(a=>`<div class="day-sport-item"><span>${a.name}</span><span>${a.kcal} kcal</span></div>`).join('')}</div>`:'';
-  box.innerHTML=`
-    <div class="day-detail-head">
-      <span>${fmtDate(iso)}</span>
-      <button class="btn-mini" id="day-edit-btn">✎ Modifier ce jour</button>
+<!-- ===================== PASSWORD SCREEN ===================== -->
+<div id="screen-password" class="screen">
+  <div class="auth-card">
+    <div class="brand centered">
+      <img class="brand-mark" src="icon.svg" alt="Métabolyse" width="34" height="34" />
+      <span class="brand-name">Métabolyse</span>
     </div>
-    <dl>
-      <dt>Calories</dt><dd>${fmt0(log.calories)} kcal</dd>
-      <dt>Sport</dt><dd>${fmt0(sport)} kcal</dd>
-      <dt>TDEE</dt><dd>${fmt0(tdee)} kcal</dd>
-      <dt>Bilan</dt><dd>${bal!=null?(bal>0?'+':'')+fmt0(bal):'—'} kcal</dd>
-      <dt>Poids</dt><dd>${fmt1(log.weight)} kg</dd>
-      <dt>Masse grasse</dt><dd>${fmt1(log.bodyfat)} %</dd>
-      <dt>Masse musculaire</dt><dd>${fmt1(log.muscle)} %</dd>
-      <dt>Sommeil</dt><dd>${log.sleepDuration??'—'}h · score ${log.sleepScore??'—'}</dd>
-      <dt>Notes</dt><dd>${log.notes||'—'}</dd>
-    </dl>
-    ${sportHtml}
-    <div class="chart-wrap"><canvas id="chart-day-detail" height="90"></canvas></div>`;
-  $('#day-edit-btn').addEventListener('click',()=>window.openLogForDate(iso));
+    <p class="auth-sub">Accès protégé</p>
+    <div class="auth-form">
+      <label>Mot de passe
+        <input type="password" id="pw-input" placeholder="••••••••" autocomplete="current-password" />
+      </label>
+      <div id="pw-error" class="pw-error hidden">Mot de passe incorrect</div>
+      <button class="btn primary full" id="pw-submit">Entrer</button>
+    </div>
+  </div>
+</div>
 
-  if(log.calories!=null){
-    const theme=chartTheme();
-    charts.dayDetail=new Chart($('#chart-day-detail'),{
-      type:'bar',
-      data:{labels:['Bilan du jour'],datasets:[
-        {label:'Ingéré',data:[consumed],backgroundColor:theme.accent,borderRadius:6},
-        {label:'Dépensé (TDEE)',data:[tdee],backgroundColor:theme.warn,borderRadius:6},
-        {label:'Restant',data:[remaining],backgroundColor:theme.grid==='rgba(255,255,255,0.06)'?'#9AA8A0':'#5B6660',borderRadius:6},
-      ]},
-      options:{...baseOpts(theme),indexAxis:'y',scales:{
-        x:{ticks:{color:theme.text},grid:{color:theme.grid}},
-        y:{ticks:{color:theme.text},grid:{display:false}}
-      }}
-    });
-  }
-}
+<!-- ===================== LOADING / RETRY ===================== -->
+<div id="screen-loading" class="screen hidden">
+  <div class="auth-card">
+    <div class="brand centered">
+      <img class="brand-mark" src="icon.svg" alt="Métabolyse" width="34" height="34" />
+      <span class="brand-name">Métabolyse</span>
+    </div>
+    <p class="auth-sub" id="loading-status">Récupération de vos données…</p>
+    <button class="btn primary full hidden" id="loading-retry">Réessayer</button>
+  </div>
+</div>
 
-/* =========================================================
-   RENDER — SINCE START
-   ========================================================= */
-function renderSinceStart(){
-  const p=DB.profile;
-  const w=buildWeightSeries();
-  const bf=buildSeries('bodyfat');
-  const mm=buildSeries('muscle');
-  const logs=getLogsSorted();
-  const {adapted}=computeAdaptiveBMR(p);
+<!-- ===================== ONBOARDING ===================== -->
+<div id="onboarding" class="screen hidden">
+  <div class="onboard-card">
+    <div class="brand">
+      <img class="brand-mark" src="icon.svg" alt="Métabolyse" width="34" height="34" />
+      <span class="brand-name">Métabolyse</span>
+    </div>
+    <p class="onboard-sub">Trois minutes de réglages, puis 30 secondes par jour.</p>
 
-  // Use profile start weight if set, else first log
-  const startW = p.startWeight ?? w[0]?.value ?? p.weight;
-  const startBf= p.startBodyfat ?? bf[0]?.value ?? p.bodyfat;
-  const nowW   = getLatestField('weight') ?? p.weight;
-  const nowBf  = getLatestField('bodyfat') ?? p.bodyfat;
-  const nowMm  = getLatestField('muscle')  ?? p.muscle;
-
-  const wLost = startW - nowW;
-  const bfKgStart = startW*(startBf??0)/100;
-  const bfKgNow   = nowW*(nowBf??0)/100;
-  const fatLostKg = bfKgStart - bfKgNow;
-  const mmKgStart = startW*(p.startMuscle??mm[0]?.value??0)/100;
-  const mmKgNow   = nowW*(nowMm??0)/100;
-  const muscleDelta = mmKgNow - mmKgStart;
-
-  const startDate = p.startDate || w[0]?.date || todayISO();
-  const nDays = daysBetween(startDate, todayISO());
-
-  // cumulative deficit
-  let cumDeficit=0;
-  logs.filter(l=>l.calories!=null).forEach(l=>{
-    const sp=getSportKcal(l);
-    cumDeficit+=getTDEE(adapted,sp)-l.calories;
-  });
-  const fatEquiv = cumDeficit/7700;
-
-  // weekly speed
-  const weeklySpeed = nDays>0 ? (wLost/nDays*7) : 0;
-
-  // success probability
-  const target=p.targetWeight??DB.goals.targetWeight;
-  let successPct='—';
-  if(target&&wLost>0){
-    const needed=startW-target;
-    const pct=Math.min(100,Math.round((wLost/needed)*100));
-    successPct=pct+'%';
-  }
-
-  $('#ss-weight-lost').textContent = wLost>0 ? fmt1(wLost) : '0';
-  $('#ss-fat-lost').textContent    = fatLostKg>0 ? fmt1(fatLostKg) : '0';
-  $('#ss-muscle-delta').textContent= (muscleDelta>=0?'+':'')+fmt1(muscleDelta)+' kg';
-  $('#ss-days').textContent        = nDays;
-  $('#ss-success-pct').textContent = successPct;
-  $('#ss-deficit-total').textContent= fmt0(cumDeficit);
-  $('#ss-fat-equiv').textContent   = fmt1(fatEquiv);
-  $('#ss-weekly-speed').textContent= fmt1(weeklySpeed);
-
-  // Progress bars
-  const ssBox=$('#ss-progress-bars');
-  ssBox.innerHTML='';
-  const pRows=[
-    {label:'Poids',  start:startW,   now:nowW,  target:target||DB.goals.targetWeight, unit:'kg', dir:-1},
-    {label:'Graisse',start:startBf,  now:nowBf, target:DB.goals.targetBodyfat,         unit:'%',  dir:-1},
-    {label:'Muscle', start:nowMm,    now:nowMm, target:DB.goals.targetMuscle,           unit:'%',  dir:1},
-  ];
-  pRows.forEach(r=>{
-    if(!r.target) return;
-    const total=Math.abs(r.start-r.target)||1;
-    const done=r.dir>0?Math.max(0,r.now-r.start):Math.max(0,r.start-r.now);
-    const pct=Math.max(0,Math.min(100,Math.round((done/total)*100)));
-    const d=document.createElement('div'); d.className='goal-row';
-    d.innerHTML=`<span class="trio-label">${r.label} — ${fmt1(r.start)} → ${fmt1(r.target)} ${r.unit} <strong>(actuel: ${fmt1(r.now)} ${r.unit})</strong></span>
-      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
-      <span class="trio-label">${pct}% atteint</span>`;
-    ssBox.appendChild(d);
-  });
-
-  // Since-start chart
-  destroySinceChart();
-  const theme=chartTheme();
-  if($('#chart-since-weight')&&w.length){
-    const startPoint={date:startDate,value:startW};
-    const fullSeries=[startPoint,...w.filter(p=>p.date>startDate)];
-    const ma=movingAverage(fullSeries,7);
-    charts.sinceWeight=new Chart($('#chart-since-weight'),{
-      type:'line',
-      data:{labels:fullSeries.map(p=>p.date),datasets:[
-        {label:'Poids réel',data:fullSeries.map(p=>p.value),borderColor:theme.text,pointRadius:2,tension:.2},
-        {label:'Tendance 7j',data:ma.map(p=>p.value),borderColor:theme.accent,borderWidth:2,pointRadius:0,tension:.3},
-        target?{label:`Objectif (${target}kg)`,data:fullSeries.map(()=>target),borderColor:theme.bad,borderDash:[6,3],borderWidth:1,pointRadius:0}:null,
-      ].filter(Boolean)},
-      options:{...baseOpts(theme),maintainAspectRatio:false}
-    });
-  }
-
-  // Badges
-  const badgeGroups=computeBadges();
-  $('#badges-grid').innerHTML=badgeGroups.map(g=>`
-    <div class="badge-group">
-      <div class="badge-group-title">${g.group}</div>
-      <div class="badges-grid">
-        ${g.items.map(b=>`
-          <div class="badge ${b.earned?'earned':'locked'}" title="${b.desc}">
-            <div class="badge-icon">${b.icon}</div>
-            <div class="badge-name">${b.name}</div>
-          </div>`).join('')}
+    <form id="profile-form" class="onboard-form">
+      <!-- STEP 1 -->
+      <div class="step active" data-step="1">
+        <h2>Toi, en quelques chiffres</h2>
+        <div class="field-grid">
+          <label>Sexe
+            <select name="sex" required>
+              <option value="female">Femme</option>
+              <option value="male">Homme</option>
+            </select>
+          </label>
+          <label>Date de naissance
+            <input type="date" name="birthdate" required />
+          </label>
+          <label>Taille (cm)
+            <input type="number" name="height" min="100" max="250" required />
+          </label>
+          <label>Poids actuel (kg)
+            <input type="number" step="0.1" name="weight" min="30" max="300" required />
+          </label>
+        </div>
       </div>
-    </div>`).join('');
 
-  // Success calendar (last 90 days)
-  renderSuccessCalendar();
-}
-function destroySinceChart(){ if(charts.sinceWeight){ charts.sinceWeight.destroy(); delete charts.sinceWeight; } }
+      <!-- STEP 2 -->
+      <div class="step" data-step="2">
+        <h2>Métabolisme de base</h2>
+        <p class="hint">Entre ton BMR de départ (mesuré ou estimé). L'app l'ajustera automatiquement selon ton évolution.</p>
+        <div class="field-grid">
+          <label>BMR de base (kcal/jour)
+            <input type="number" name="baseBMR" min="800" max="4000" placeholder="Ex: 1800" required />
+          </label>
+          <label>Date de début du suivi
+            <input type="date" name="startDate" required />
+          </label>
+          <label>Poids de départ (kg)
+            <input type="number" step="0.1" name="startWeight" min="30" max="300" placeholder="Poids au début du suivi" />
+          </label>
+          <label>Masse grasse de départ (%)
+            <input type="number" step="0.1" name="startBodyfat" placeholder="Optionnel" />
+          </label>
+        </div>
+      </div>
 
-function renderSuccessCalendar(){
-  const {adapted}=computeAdaptiveBMR(DB.profile);
-  const sc=$('#success-calendar');
-  sc.innerHTML='';
-  const today=todayISO();
-  for(let i=89;i>=0;i--){
-    const iso=addDays(today,-i);
-    const log=DB.logs[iso];
-    const cell=document.createElement('div');
-    cell.className='sc-cell';
-    cell.title=iso;
-    if(log?.calories!=null){
-      const b=dailyBalance(log,adapted);
-      cell.classList.add(b!=null&&b<0?'success':'fail');
-    }
-    sc.appendChild(cell);
-  }
-}
+      <!-- STEP 3 -->
+      <div class="step" data-step="3">
+        <h2>Composition corporelle actuelle</h2>
+        <p class="hint">Ces valeurs serviront de point de référence. Tu pourras les mettre à jour chaque jour.</p>
+        <div class="field-grid">
+          <label>Masse grasse actuelle (%)
+            <input type="number" step="0.1" name="bodyfat" placeholder="Ex: 25" />
+          </label>
+          <label>Masse musculaire actuelle (%)
+            <input type="number" step="0.1" name="muscle" placeholder="Ex: 40" />
+          </label>
+          <label>Objectif de poids (kg)
+            <input type="number" step="0.1" name="targetWeight" placeholder="Ex: 75" />
+          </label>
+          <label>Objectif masse grasse (%)
+            <input type="number" step="0.1" name="targetBodyfat" placeholder="Ex: 15" />
+          </label>
+        </div>
+      </div>
 
-/* =========================================================
-   RENDER — GOALS
-   ========================================================= */
-function renderGoals(){
-  const f=$('#goals-form');
-  f.targetWeight.value   = DB.goals.targetWeight??'';
-  f.targetBodyfat.value  = DB.goals.targetBodyfat??'';
-  f.targetMuscle.value   = DB.goals.targetMuscle??'';
-  f.startWeightRef.value = DB.goals.startWeightRef??'';
+      <!-- STEP 4: Cloud sync -->
+      <div class="step" data-step="4">
+        <h2>Synchronisation des données</h2>
+        <p class="hint">Pour accéder à tes données depuis n'importe quel appareil, l'app utilise JSONBin.io (gratuit). Crée un compte sur <strong>jsonbin.io</strong>, puis crée un "Bin" et colle ta clé API et l'ID du Bin ici.</p>
+        <p class="hint" style="background:var(--surface-2,rgba(255,255,255,0.05));padding:10px;border-radius:8px;margin-bottom:8px;">
+          💡 <strong>Déjà configuré sur un autre appareil ?</strong> Entre simplement tes identifiants JSONBin ci-dessous — ton profil et toutes tes données seront récupérés automatiquement sans avoir à tout ressaisir.
+        </p>
+        <div class="field-grid-1">
+          <label>Clé API JSONBin (X-Master-Key)
+            <input type="text" name="jsonbinKey" placeholder="$2a$10$..." />
+          </label>
+          <label>Bin ID
+            <input type="text" name="jsonbinId" placeholder="6...abc" />
+          </label>
+        </div>
+        <p class="hint" style="margin-top:10px;">Tu peux aussi continuer sans synchronisation (données locales uniquement).</p>
+      </div>
 
-  const p=DB.profile;
-  const wNow  = getLatestField('weight')  ?? p.weight;
-  const bfNow = getLatestField('bodyfat') ?? p.bodyfat;
-  const mmNow = getLatestField('muscle')  ?? p.muscle;
-  const startRef = DB.goals.startWeightRef || buildWeightSeries()[0]?.value || wNow;
+      <div class="onboard-nav">
+        <button type="button" id="ob-back" class="btn ghost hidden">Retour</button>
+        <div class="step-dots">
+          <span class="dot active"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        </div>
+        <button type="button" id="ob-next" class="btn primary">Continuer</button>
+        <button type="submit" id="ob-submit" class="btn primary hidden">Créer mon profil</button>
+      </div>
+    </form>
+  </div>
+</div>
 
-  const box=$('#goals-progress'); box.innerHTML='';
-  const rows=[
-    {label:'Poids',    now:wNow,  start:startRef, target:DB.goals.targetWeight,  unit:'kg'},
-    {label:'Masse grasse', now:bfNow, start:buildSeries('bodyfat')[0]?.value??bfNow, target:DB.goals.targetBodyfat, unit:'%'},
-    {label:'Masse musculaire', now:mmNow, start:buildSeries('muscle')[0]?.value??mmNow, target:DB.goals.targetMuscle, unit:'%'},
-  ];
-  rows.forEach(r=>{
-    if(!r.target) return;
-    const total=Math.abs(r.start-r.target)||1;
-    const done=Math.abs(r.start-r.now);
-    const pct=Math.max(0,Math.min(100,Math.round((done/total)*100)));
-    const d=document.createElement('div'); d.className='goal-row';
-    d.innerHTML=`<span class="trio-label">${r.label} — ${fmt1(r.now)} → ${fmt1(r.target)} ${r.unit}</span>
-      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
-      <span class="trio-label">${pct}% atteint</span>`;
-    box.appendChild(d);
-  });
-  if(!box.children.length) box.innerHTML='<p class="hint">Définis un objectif pour suivre ta progression.</p>';
+<!-- ===================== APP SHELL ===================== -->
+<div id="app" class="screen hidden">
+  <header class="topbar">
+    <div class="brand"><img class="brand-mark" src="icon.svg" alt="Métabolyse" width="34" height="34" /><span class="brand-name">Métabolyse</span></div>
+    <nav class="tabs" id="tabs">
+      <button data-view="dashboard" class="tab active">Aujourd'hui</button>
+      <button data-view="trends" class="tab">Tendances</button>
+      <button data-view="history" class="tab">Historique</button>
+      <button data-view="since-start" class="tab">Depuis le début</button>
+      <button data-view="goals" class="tab">Objectifs</button>
+      <button data-view="journal" class="tab">Journal</button>
+    </nav>
+    <div class="top-actions">
+      <button id="sync-settings-btn" class="icon-btn" title="Réglages de synchronisation">⚙️</button>
+      <button id="sync-btn" class="icon-btn sync-btn" title="Synchroniser">↻</button>
+      <button id="theme-toggle" class="icon-btn" title="Changer de thème">🌙</button>
+      <button id="export-btn" class="icon-btn" title="Exporter le rapport">⤓</button>
+    </div>
+  </header>
 
-  // ETA
-  const etaBox=$('#goals-eta'); etaBox.innerHTML='';
-  if(DB.goals.targetWeight){
-    const eta=estimateGoalDate(DB.goals.targetWeight);
-    const row=document.createElement('div'); row.className='eta-row';
-    row.innerHTML=`<span>Poids cible (${DB.goals.targetWeight} kg)</span><span class="eta-date">${eta||'—'}</span>`;
-    etaBox.appendChild(row);
-  }
-  if(!etaBox.children.length) etaBox.innerHTML='<p class="hint">Ajoute un objectif de poids pour estimer la date d\'atteinte.</p>';
-}
+  <main id="views">
 
-/* =========================================================
-   RENDER — JOURNAL
-   ========================================================= */
-function renderJournal(){
-  const box=$('#journal-list');
-  const entries=getLogsSorted().filter(l=>l.notes||l.mood||l.energy||l.sleepDuration||l.sleepScore||l.photo).reverse();
-  if(!entries.length){ box.innerHTML='<p class="hint">Aucune entrée pour le moment.</p>'; return; }
-  box.innerHTML=entries.map(l=>`
-    <div class="journal-entry">
-      <div class="j-date">${fmtDate(l.date)}</div>
-      ${l.notes?`<div>${l.notes}</div>`:''}
-      <div class="hint">${l.mood?`Humeur: ${l.mood}/5 &nbsp;`:''}${l.energy?`Énergie: ${l.energy}/5`:''}</div>
-      ${(l.sleepDuration||l.sleepScore)?`<div class="j-sleep">😴 ${l.sleepDuration?l.sleepDuration+'h':''}${l.sleepDuration&&l.sleepScore?' · ':''}${l.sleepScore?'Score '+l.sleepScore:''}</div>`:''}
-      ${l.photo?`<img src="${l.photo}" alt="progression" />`:''}
-    </div>`).join('');
-}
+    <!-- ===== DASHBOARD ===== -->
+    <section id="view-dashboard" class="view active">
+      <div class="welcome-banner" id="welcome-banner">
+        <div class="welcome-text">
+          <div class="welcome-greeting" id="welcome-greeting">Bonjour, Mathéo 👋</div>
+          <div class="welcome-sub" id="welcome-sub">Voici où en est ton suivi aujourd'hui.</div>
+        </div>
+      </div>
 
-/* =========================================================
-   RENDER ALL
-   ========================================================= */
-function renderAll(){
-  renderDashboard();
-  // renderCharts() intentionally omitted here — charts are only rendered when
-  // the Tendances tab is actually visible, to avoid Chart.js receiving a 0×0 canvas.
-  renderCalendar();
-  // renderSinceStart() also deferred to tab click to avoid hidden-canvas issues
-  renderGoals();
-  renderJournal();
-}
+      <div class="quick-log-bar">
+        <button class="btn primary" id="open-log">+ Saisie du jour</button>
+        <div class="insight-pill" id="top-insight">Bienvenue ! Ajoute ta première saisie pour démarrer l'analyse.</div>
+      </div>
 
-/* =========================================================
-   SPORT ACTIVITIES IN MODAL
-   ========================================================= */
-function addSportRow(name='', kcal=''){
-  const tpl=$('#sport-activity-tpl');
-  const clone=tpl.content.cloneNode(true);
-  const row=clone.querySelector('.sport-activity-row');
-  row.querySelector('.sport-name').value=name;
-  row.querySelector('.sport-kcal').value=kcal;
-  row.querySelector('.sport-remove').addEventListener('click',()=>row.remove());
-  $('#sport-activities-list').appendChild(clone);
-}
-function getSportActivitiesFromForm(){
-  const rows=$$('.sport-activity-row');
-  const result=[];
-  rows.forEach(row=>{
-    const name=row.querySelector('.sport-name').value.trim();
-    const kcal=parseFloat(row.querySelector('.sport-kcal').value)||0;
-    if(name||kcal) result.push({name:name||'Activité',kcal});
-  });
-  return result;
-}
+      <div class="grid-cards">
+        <!-- Calories -->
+        <div class="card cal-card">
+          <div class="card-head"><span>Calories aujourd'hui</span></div>
+          <div class="big-row">
+            <div class="big-num" id="cal-consumed">0</div>
+            <div class="big-sub">/ <span id="cal-target">—</span> kcal</div>
+          </div>
+          <div class="progress-bar"><div class="progress-fill" id="cal-progress"></div></div>
+          <div class="card-foot">
+            <span id="cal-remaining">—</span> restantes &nbsp;|&nbsp; Sport: <span id="cal-sport-today">0</span> kcal
+          </div>
+        </div>
 
-/* =========================================================
-   ONBOARDING
-   ========================================================= */
-let obStep=1;
-const OB_STEPS=4;
-function setupOnboarding(){
-  // Do NOT call remove('hidden') here — showAppScreen() decides what to show
-  $('#ob-next').addEventListener('click',()=>{ if(obStep<OB_STEPS){obStep++;updateObStep();} });
-  $('#ob-back').addEventListener('click',()=>{ if(obStep>1){obStep--;updateObStep();} });
-  $('#profile-form').addEventListener('submit',async e=>{
-    e.preventDefault();
-    const fd=new FormData(e.target);
-    const jsonbinKey=fd.get('jsonbinKey')||null;
-    const jsonbinId=fd.get('jsonbinId')||null;
+        <!-- Déficit -->
+        <div class="card">
+          <div class="card-head"><span>Déficit calorique</span></div>
+          <div class="trio">
+            <div><span class="trio-label">Aujourd'hui</span><span class="trio-val" id="deficit-day">—</span></div>
+            <div><span class="trio-label">7 jours</span><span class="trio-val" id="deficit-week">—</span></div>
+            <div><span class="trio-label">30 jours</span><span class="trio-val" id="deficit-month">—</span></div>
+          </div>
+          <div class="status-chip" id="deficit-status">En attente de données</div>
+        </div>
 
-    // If cloud credentials provided, try to pull existing data first
-    if(jsonbinKey && jsonbinId){
-      showToast('⏳ Récupération des données cloud…');
-      const remote = await Store.pull(jsonbinKey, jsonbinId);
-      if(remote?.profile){
-        // Found existing data in cloud — use it directly, no need to re-enter profile
-        DB = remote;
-        DB.profile.jsonbinKey = jsonbinKey;
-        DB.profile.jsonbinId  = jsonbinId;
-        Store.save(DB);
-        showToast('✓ Profil récupéré depuis le cloud !');
-        showAppScreen();
-        return;
-      }
-    }
+        <!-- Métabolisme -->
+        <div class="card">
+          <div class="card-head"><span>Métabolisme</span>
+            <button class="btn-mini" id="edit-bmr-btn">Modifier BMR</button>
+          </div>
+          <div class="trio">
+            <div><span class="trio-label">BMR manuel</span><span class="trio-val" id="bmr-manual">—</span></div>
+            <div><span class="trio-label">BMR adapté</span><span class="trio-val" id="bmr-adapt">—</span></div>
+            <div><span class="trio-label">TDEE total</span><span class="trio-val" id="tdee-total">—</span></div>
+          </div>
+        </div>
 
-    // No cloud data found (or no credentials) — create a new profile from the form
-    const profile={
-      sex:fd.get('sex'), birthdate:fd.get('birthdate'),
-      height:parseFloat(fd.get('height')),
-      weight:parseFloat(fd.get('weight')),
-      baseBMR:parseFloat(fd.get('baseBMR'))||1800,
-      startDate:fd.get('startDate')||todayISO(),
-      startWeight:parseFloat(fd.get('startWeight'))||parseFloat(fd.get('weight')),
-      startBodyfat:parseFloat(fd.get('startBodyfat'))||null,
-      bodyfat:parseFloat(fd.get('bodyfat'))||null,
-      muscle:parseFloat(fd.get('muscle'))||null,
-      targetWeight:parseFloat(fd.get('targetWeight'))||null,
-      targetBodyfat:parseFloat(fd.get('targetBodyfat'))||null,
-      jsonbinKey,
-      jsonbinId,
-    };
-    DB.profile=profile;
-    DB.goals={
-      targetWeight:profile.targetWeight,
-      targetBodyfat:profile.targetBodyfat,
-    };
-    DB.logs[todayISO()]=DB.logs[todayISO()]||{date:todayISO(),weight:profile.weight,bodyfat:profile.bodyfat,muscle:profile.muscle};
-    persist();
-    showAppScreen();
-  });
-}
-function updateObStep(){
-  $$('.step').forEach(s=>s.classList.toggle('active',parseInt(s.dataset.step)===obStep));
-  $$('.dot').forEach((d,i)=>d.classList.toggle('active',i===obStep-1));
-  $('#ob-back').classList.toggle('hidden',obStep===1);
-  $('#ob-next').classList.toggle('hidden',obStep===OB_STEPS);
-  $('#ob-submit').classList.toggle('hidden',obStep!==OB_STEPS);
-}
+        <!-- Poids -->
+        <div class="card">
+          <div class="card-head"><span>Poids</span></div>
+          <div class="big-row"><div class="big-num" id="weight-current">—</div><div class="big-sub">kg</div></div>
+          <div class="trio small">
+            <div><span class="trio-label">7 j</span><span class="trio-val" id="weight-week">—</span></div>
+            <div><span class="trio-label">30 j</span><span class="trio-val" id="weight-month">—</span></div>
+          </div>
+        </div>
 
-/* =========================================================
-   APP INTERACTIONS
-   ========================================================= */
-function setupTabs(){
-  $$('.tab').forEach(tab=>{
-    tab.addEventListener('click',()=>{
-      $$('.tab').forEach(t=>t.classList.remove('active'));
-      tab.classList.add('active');
-      $$('.view').forEach(v=>v.classList.remove('active'));
-      const view=$('#view-'+tab.dataset.view);
-      view.classList.add('active');
-      // Use setTimeout(0) after display change so the browser has fully
-      // computed layout before Chart.js measures canvas dimensions.
-      if(tab.dataset.view==='trends'){
-        setTimeout(()=>renderCharts(), 0);
-      }
-      if(tab.dataset.view==='since-start'){
-        setTimeout(()=>renderSinceStart(), 0);
-      }
-    });
-  });
-}
+        <!-- Composition -->
+        <div class="card">
+          <div class="card-head"><span>Composition corporelle</span></div>
+          <div class="comp-grid" id="comp-grid">
+            <div><span class="trio-label">Masse grasse</span><span class="trio-val" id="bf-pct">—</span><span class="trio-label" id="bf-kg">—</span></div>
+            <div><span class="trio-label">Masse musculaire</span><span class="trio-val" id="mm-pct">—</span><span class="trio-label" id="mm-kg">—</span></div>
+            <div><span class="trio-label">Masse maigre</span><span class="trio-val" id="lean-kg">—</span></div>
+            <div><span class="trio-label">% perte en graisse</span><span class="trio-val" id="fat-loss-pct">—</span></div>
+          </div>
+        </div>
 
-function setupTheme(){
-  const saved=localStorage.getItem(THEME_KEY)||'dark';
-  document.documentElement.dataset.theme=saved;
-  $('#theme-toggle').textContent=saved==='dark'?'🌙':'☀️';
-  $('#theme-toggle').addEventListener('click',()=>{
-    const cur=document.documentElement.dataset.theme;
-    const next=cur==='dark'?'light':'dark';
-    document.documentElement.dataset.theme=next;
-    localStorage.setItem(THEME_KEY,next);
-    $('#theme-toggle').textContent=next==='dark'?'🌙':'☀️';
-    // Only re-render charts if the trends tab is currently visible
-    if(DB.profile && document.querySelector('.tab[data-view="trends"]')?.classList.contains('active')){
-      requestAnimationFrame(()=>requestAnimationFrame(()=>renderCharts()));
-    }
-  });
-}
+        <!-- Scores -->
+        <div class="card">
+          <div class="card-head"><span>Scores</span></div>
+          <div class="trio">
+            <div><span class="trio-label">Fat Loss Eff.</span><span class="trio-val" id="score-fle">—</span></div>
+            <div><span class="trio-label">Muscle Pres.</span><span class="trio-val" id="score-mps">—</span></div>
+          </div>
+          <div class="sleep-summary" id="sleep-summary-dash">
+            <span class="trio-label">Nuit dernière</span>
+            <span id="sleep-dash">—</span>
+          </div>
+        </div>
+      </div>
 
-function setupLogModal(){
-  // Open
-  const openLogForDate=(dateISO)=>{
-    const ex=DB.logs[dateISO]||{};
-    const form=$('#log-form');
-    form.date.value=dateISO;
-    form.calories.value=ex.calories??'';
-    form.weight.value=ex.weight??'';
-    form.bodyfat.value=ex.bodyfat??'';
-    form.muscle.value=ex.muscle??'';
-    form.mood.value=ex.mood??'';
-    form.energy.value=ex.energy??'';
-    form.sleepDuration.value=ex.sleepDuration??'';
-    form.sleepScore.value=ex.sleepScore??'';
-    form.notes.value=ex.notes??'';
-    // Populate sports
-    $('#sport-activities-list').innerHTML='';
-    (ex.sports||[]).forEach(a=>addSportRow(a.name,a.kcal));
-    $('#log-modal').classList.remove('hidden');
-  };
-  window.openLogForDate=openLogForDate;
-  $('#open-log').addEventListener('click',()=>openLogForDate(todayISO()));
-  $('#close-log').addEventListener('click',()=>$('#log-modal').classList.add('hidden'));
-  $('#log-modal').addEventListener('click',e=>{if(e.target.id==='log-modal')$('#log-modal').classList.add('hidden');});
-  $('#add-sport-btn').addEventListener('click',()=>addSportRow());
+      <div class="card chart-card wide">
+        <div class="card-head"><span>Calories des derniers jours</span></div>
+        <div class="chart-wrap"><canvas id="chart-today-calories"></canvas></div>
+        <div class="legend" style="margin-top:10px;">
+          <span><i class="dot-i deficit-strong" style="background:var(--accent)"></i>Ingéré</span>
+          <span><i class="dot-i surplus-strong" style="background:var(--warn)"></i>Dépensé (TDEE)</span>
+          <span><i class="dot-i maintenance" style="background:var(--text-dim)"></i>Restant</span>
+        </div>
+      </div>
 
-  // Submit
-  $('#log-form').addEventListener('submit',e=>{
-    e.preventDefault();
-    const fd=new FormData(e.target);
-    const date=fd.get('date');
-    const entry=DB.logs[date]||{date};
-    entry.calories=parseFloat(fd.get('calories'))||null;
-    entry.weight=parseFloat(fd.get('weight'))||entry.weight||null;
-    entry.bodyfat=parseFloat(fd.get('bodyfat'))||entry.bodyfat||null;
-    entry.muscle=parseFloat(fd.get('muscle'))||entry.muscle||null;
-    entry.mood=fd.get('mood')||null;
-    entry.energy=fd.get('energy')||null;
-    entry.sleepDuration=parseFloat(fd.get('sleepDuration'))||null;
-    entry.sleepScore=parseFloat(fd.get('sleepScore'))||null;
-    entry.notes=fd.get('notes')||null;
-    entry.sports=getSportActivitiesFromForm();
-    entry.updatedAt=Date.now();
-    const photo=fd.get('photo');
-    const finish=()=>{
-      DB.logs[date]=entry;
-      persist();
-      $('#log-modal').classList.add('hidden');
-      renderAll();
-    };
-    if(photo&&photo.size){
-      const r=new FileReader();
-      r.onload=()=>{ entry.photo=r.result; finish(); };
-      r.readAsDataURL(photo);
-    } else finish();
-  });
-}
+      <div class="card insights-card">
+        <div class="card-head"><span>Analyse intelligente</span></div>
+        <ul id="insights-list" class="insights-list"></ul>
+      </div>
+    </section>
 
-function setupBMRModal(){
-  $('#edit-bmr-btn').addEventListener('click',()=>{
-    $('#bmr-input').value=DB.profile?.baseBMR||'';
-    $('#bmr-modal').classList.remove('hidden');
-  });
-  $('#close-bmr').addEventListener('click',()=>$('#bmr-modal').classList.add('hidden'));
-  $('#bmr-form').addEventListener('submit',e=>{
-    e.preventDefault();
-    const v=parseFloat($('#bmr-input').value);
-    if(v>=800&&v<=4000){
-      DB.profile.baseBMR=v;
-      persist();
-      renderAll();
-    }
-    $('#bmr-modal').classList.add('hidden');
-  });
-}
+    <!-- ===== TRENDS ===== -->
+    <section id="view-trends" class="view">
+      <div class="chart-grid">
+        <div class="card chart-card">
+          <div class="card-head"><span>Évolution du poids</span></div>
+          <div class="chart-wrap"><canvas id="chart-weight"></canvas></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-head"><span>Masse grasse / Masse musculaire (%)</span></div>
+          <div class="chart-wrap"><canvas id="chart-composition"></canvas></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-head"><span>Composition en kg</span></div>
+          <div class="chart-wrap"><canvas id="chart-composition-kg"></canvas></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-head"><span>Métabolisme : BMR manuel vs adapté</span></div>
+          <div class="chart-wrap"><canvas id="chart-metabolism"></canvas></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-head"><span>Déficit cumulé</span></div>
+          <div class="chart-wrap"><canvas id="chart-deficit"></canvas></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-head"><span>Sommeil</span></div>
+          <div class="chart-wrap"><canvas id="chart-sleep"></canvas></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span>Prédictions</span></div>
+        <div class="predict-grid">
+          <div><span class="trio-label">Dans 30 jours</span><span class="trio-val" id="pred-30">—</span></div>
+          <div><span class="trio-label">Dans 60 jours</span><span class="trio-val" id="pred-60">—</span></div>
+          <div><span class="trio-label">Dans 90 jours</span><span class="trio-val" id="pred-90">—</span></div>
+          <div><span class="trio-label">Date objectif poids</span><span class="trio-val" id="pred-goal-date">—</span></div>
+        </div>
+      </div>
+    </section>
 
-function setupGoals(){
-  $('#goals-form').addEventListener('submit',e=>{
-    e.preventDefault();
-    const fd=new FormData(e.target);
-    DB.goals={
-      targetWeight:parseFloat(fd.get('targetWeight'))||null,
-      targetBodyfat:parseFloat(fd.get('targetBodyfat'))||null,
-      targetMuscle:parseFloat(fd.get('targetMuscle'))||null,
-      startWeightRef:parseFloat(fd.get('startWeightRef'))||null,
-    };
-    persist();
-    renderGoals();
-  });
-}
+    <!-- ===== HISTORY ===== -->
+    <section id="view-history" class="view">
+      <div class="card">
+        <div class="card-head">
+          <span id="calendar-title">Historique</span>
+          <div class="cal-nav">
+            <button class="icon-btn" id="cal-prev">‹</button>
+            <button class="icon-btn" id="cal-next">›</button>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="dot-i deficit-strong"></i>Déficit optimal</span>
+          <span><i class="dot-i deficit-light"></i>Déficit léger</span>
+          <span><i class="dot-i maintenance"></i>Maintenance</span>
+          <span><i class="dot-i surplus-light"></i>Surplus léger</span>
+          <span><i class="dot-i surplus-strong"></i>Surplus important</span>
+        </div>
+        <div class="cal-weekdays">
+          <span>Lun</span><span>Mar</span><span>Mer</span><span>Jeu</span><span>Ven</span><span>Sam</span><span>Dim</span>
+        </div>
+        <div id="calendar-grid" class="calendar-grid"></div>
+      </div>
+      <div id="day-detail" class="card hidden"></div>
+    </section>
 
-function setupCalendarNav(){
-  $('#cal-prev').addEventListener('click',()=>{ calendarMonth.setMonth(calendarMonth.getMonth()-1); renderCalendar(); });
-  $('#cal-next').addEventListener('click',()=>{ calendarMonth.setMonth(calendarMonth.getMonth()+1); renderCalendar(); });
-}
+    <!-- ===== DEPUIS LE DÉBUT ===== -->
+    <section id="view-since-start" class="view">
+      <!-- Hero stats -->
+      <div class="since-hero">
+        <div class="since-stat">
+          <div class="since-val" id="ss-weight-lost">—</div>
+          <div class="since-label">kg perdus</div>
+        </div>
+        <div class="since-stat">
+          <div class="since-val" id="ss-fat-lost">—</div>
+          <div class="since-label">kg de graisse perdus</div>
+        </div>
+        <div class="since-stat">
+          <div class="since-val" id="ss-muscle-delta">—</div>
+          <div class="since-label">muscle gagné/perdu</div>
+        </div>
+        <div class="since-stat">
+          <div class="since-val" id="ss-days">—</div>
+          <div class="since-label">jours de suivi</div>
+        </div>
+        <div class="since-stat">
+          <div class="since-val" id="ss-success-pct">—</div>
+          <div class="since-label">% de réussite estimé</div>
+        </div>
+      </div>
 
-function setupSyncSettings(){
-  const openBtn=$('#sync-settings-btn');
-  const modal=$('#sync-settings-modal');
-  if(!openBtn||!modal) return;
-  openBtn.addEventListener('click',()=>{
-    $('#sync-jsonbin-key').value=DB.profile?.jsonbinKey||'';
-    $('#sync-jsonbin-id').value=DB.profile?.jsonbinId||'';
-    modal.classList.remove('hidden');
-  });
-  $('#close-sync-settings').addEventListener('click',()=>modal.classList.add('hidden'));
-  modal.addEventListener('click',e=>{ if(e.target.id==='sync-settings-modal') modal.classList.add('hidden'); });
+      <!-- Progress bars -->
+      <div class="card">
+        <div class="card-head"><span>Progression vers les objectifs</span></div>
+        <div id="ss-progress-bars" class="goals-progress"></div>
+      </div>
 
-  $('#sync-settings-form').addEventListener('submit', async e=>{
-    e.preventDefault();
-    const key=$('#sync-jsonbin-key').value.trim()||null;
-    const id =$('#sync-jsonbin-id').value.trim()||null;
-    if(!DB.profile){ showToast('⚠️ Crée d\'abord ton profil'); return; }
-    DB.profile.jsonbinKey=key;
-    DB.profile.jsonbinId=id;
-    Store.save(DB);
-    modal.classList.add('hidden');
-    if(!key||!id){ showToast('ℹ️ Synchronisation désactivée (champs vides)'); return; }
-    showToast('⏳ Synchronisation en cours…');
-    // Pull remote first, merge, then push so both devices end up aligned
-    const remote=await Store.pull(key,id);
-    if(remote?.logs){
-      mergeRemoteLogs(remote.logs);
-    }
-    if(remote?.goals && !Object.keys(DB.goals||{}).length) DB.goals=remote.goals;
-    // If the remote profile differs from the local one (separate onboarding on each device),
-    // offer to adopt the remote profile so both devices share the same reference data.
-    if(remote?.profile && DB.profile && JSON.stringify(remote.profile)!==JSON.stringify(DB.profile)){
-      const adopt=confirm(
-        "Le profil enregistré sur l'autre appareil est différent du tien (poids/BMR/objectifs de départ).\n\n"+
-        "Veux-tu remplacer ton profil local par celui de l'autre appareil pour que les deux soient identiques ?\n\n"+
-        "OK = utiliser le profil distant   /   Annuler = garder mon profil actuel"
-      );
-      if(adopt) DB.profile=remote.profile;
-    }
-    Store.save(DB);
-    const ok=await Store.push(DB);
-    showToast(ok?'✓ Synchronisé avec succès':'⚠️ Identifiants invalides ou erreur réseau');
-    if(ok) renderAll();
-  });
-}
+      <!-- Full chart -->
+      <div class="card chart-card wide">
+        <div class="card-head"><span>Courbe depuis le début — Poids</span></div>
+        <div class="chart-wrap"><canvas id="chart-since-weight"></canvas></div>
+      </div>
 
-function setupSync(){
-  $('#sync-btn').addEventListener('click',async()=>{
-    const p=DB.profile;
-    if(!p?.jsonbinKey||!p?.jsonbinId){
-      showToast('ℹ️ Configure d\'abord la sync via ⚙️ Réglages');
-      return;
-    }
-    $('#sync-btn').classList.add('syncing');
-    // Pull from cloud first
-    const remote=await Store.pull(p.jsonbinKey,p.jsonbinId);
-    if(remote){
-      mergeRemoteLogs(remote.logs);
-      Store.save(DB);
-    }
-    // Push current
-    const ok=await Store.push(DB);
-    $('#sync-btn').classList.remove('syncing');
-    showToast(ok?'✓ Synchronisé':'⚠️ Erreur de synchronisation');
-    if(ok) renderAll();
-  });
-}
+      <!-- Cumulative stats -->
+      <div class="grid-cards">
+        <div class="card">
+          <div class="card-head"><span>Déficit total cumulé</span></div>
+          <div class="big-num" id="ss-deficit-total">—</div>
+          <div class="big-sub">kcal</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span>Équivalent graisse théorique</span></div>
+          <div class="big-num" id="ss-fat-equiv">—</div>
+          <div class="big-sub">kg</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span>Vitesse hebdomadaire</span></div>
+          <div class="big-num" id="ss-weekly-speed">—</div>
+          <div class="big-sub">kg/semaine</div>
+        </div>
+      </div>
 
-function setupExport(){
-  $('#export-btn').addEventListener('click',()=>{
-    const p=DB.profile;
-    const {theoretical,adapted}=computeAdaptiveBMR(p);
-    const ins=generateInsights(p);
-    const w=window.open('','_blank');
-    w.document.write(`<html><head><title>Rapport Métabolyse</title>
-      <style>body{font-family:sans-serif;padding:40px;color:#15201B;}h1{color:#1F7A5C;}li{margin-bottom:8px;}</style>
-      </head><body>
-      <h1>Rapport Métabolyse — ${todayISO()}</h1>
-      <p><b>BMR manuel:</b> ${p.baseBMR} kcal &nbsp; <b>BMR adapté:</b> ${adapted} kcal &nbsp; <b>BMR théorique ajusté:</b> ${theoretical} kcal</p>
-      <h2>Analyse</h2><ul>${ins.map(i=>`<li>${i}</li>`).join('')}</ul>
-      </body></html>`);
-    w.document.close(); w.print();
-  });
-}
+      <!-- Badges & records -->
+      <div class="card">
+        <div class="card-head"><span>Badges & Records</span></div>
+        <div id="badges-grid" class="badges-grid"></div>
+      </div>
 
-/* =========================================================
-   PASSWORD / AUTH
-   ========================================================= */
-function setupPassword(){
-  const tryLogin=()=>{
-    const v=$('#pw-input').value;
-    if(v===PASSWORD){
-      localStorage.setItem(AUTH_KEY,'1');
-      $('#screen-password').classList.add('hidden');
-      showAppScreen();
-    } else {
-      $('#pw-error').classList.remove('hidden');
-      $('#pw-input').value='';
-      $('#pw-input').focus();
-    }
-  };
-  $('#pw-submit').addEventListener('click',tryLogin);
-  $('#pw-input').addEventListener('keydown',e=>{ if(e.key==='Enter') tryLogin(); });
-}
+      <!-- Success calendar -->
+      <div class="card">
+        <div class="card-head"><span>Calendrier de réussite</span></div>
+        <div id="success-calendar" class="success-calendar"></div>
+      </div>
+    </section>
 
-function showAppScreen(){
-  if(!DB.profile){
-    // No profile yet — show onboarding, hide everything else
-    $('#screen-password').classList.add('hidden');
-    $('#onboarding').classList.remove('hidden');
-    $('#app').classList.add('hidden');
-  } else {
-    // Profile exists — go straight to app
-    $('#screen-password').classList.add('hidden');
-    $('#onboarding').classList.add('hidden');
-    $('#app').classList.remove('hidden');
-    renderAll();
-  }
-}
+    <!-- ===== GOALS ===== -->
+    <section id="view-goals" class="view">
+      <div class="card">
+        <div class="card-head"><span>Mes objectifs</span></div>
+        <form id="goals-form" class="field-grid">
+          <label>Poids cible (kg)<input type="number" step="0.1" name="targetWeight" /></label>
+          <label>Masse grasse cible (%)<input type="number" step="0.1" name="targetBodyfat" /></label>
+          <label>Masse musculaire cible (%)<input type="number" step="0.1" name="targetMuscle" /></label>
+          <label>Poids de départ (pour la progression)<input type="number" step="0.1" name="startWeightRef" /></label>
+          <button class="btn primary" type="submit" style="grid-column:span 2;">Enregistrer</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-head"><span>Progression</span></div>
+        <div id="goals-progress" class="goals-progress"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span>Date estimée d'atteinte des objectifs</span></div>
+        <div id="goals-eta" class="goals-progress"></div>
+      </div>
+    </section>
 
-/* =========================================================
-   BOOT
-   ========================================================= */
-document.addEventListener('DOMContentLoaded',()=>{
-  setupOnboarding();
-  setupTabs();
-  setupTheme();
-  setupLogModal();
-  setupBMRModal();
-  setupGoals();
-  setupCalendarNav();
-  setupSync();
-  setupSyncSettings();
-  setupExport();
+    <!-- ===== JOURNAL ===== -->
+    <section id="view-journal" class="view">
+      <div class="card">
+        <div class="card-head"><span>Journal &amp; photos de progression</span></div>
+        <div id="journal-list" class="journal-list"></div>
+      </div>
+    </section>
+  </main>
+</div>
 
-  // Determine start state:
-  // 1. Already authenticated (localStorage) + profile exists → go to app directly
-  // 2. Already authenticated but no profile → show onboarding
-  // 3. Not authenticated → show password screen
-  const authed = localStorage.getItem(AUTH_KEY) === '1';
-  if(authed){
-    showAppScreen();
-  } else {
-    // Show password screen only
-    $('#screen-password').classList.remove('hidden');
-    $('#onboarding').classList.add('hidden');
-    $('#app').classList.add('hidden');
-    setupPassword();
-  }
+<!-- ===================== LOG MODAL ===================== -->
+<div id="log-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Saisie du jour</h2>
+      <button class="icon-btn" id="close-log">✕</button>
+    </div>
+    <form id="log-form" class="modal-form">
+      <label>Date<input type="date" name="date" required /></label>
 
-  if('serviceWorker' in navigator){
-    navigator.serviceWorker.register('sw.js').catch(()=>{});
-  }
+      <div class="modal-section-title">📊 Mesures corporelles</div>
+      <div class="field-grid">
+        <label>Poids (kg)<input type="number" step="0.1" name="weight" /></label>
+        <label>Masse grasse (%)<input type="number" step="0.1" name="bodyfat" /></label>
+        <label>Masse musculaire (%)<input type="number" step="0.1" name="muscle" /></label>
+      </div>
 
-  // Auto-sync on load if credentials available
-  setTimeout(async()=>{
-    const p=DB.profile;
-    if(p?.jsonbinKey&&p?.jsonbinId){
-      const remote=await Store.pull(p.jsonbinKey,p.jsonbinId);
-      if(remote?.logs){
-        const changed=mergeRemoteLogs(remote.logs);
-        if(changed){ Store.save(DB); renderAll(); showToast('✓ Données récupérées depuis le cloud'); }
-      }
-    }
-  }, 1000);
-});
+      <div class="modal-section-title">🍽️ Alimentation</div>
+      <label>Calories consommées (kcal)<input type="number" name="calories" required /></label>
+
+      <div class="modal-section-title">🏃 Activités sportives</div>
+      <div id="sport-activities-list"></div>
+      <button type="button" class="btn ghost" id="add-sport-btn" style="width:100%;margin-top:4px;">+ Ajouter une activité</button>
+
+      <div class="modal-section-title">😴 Sommeil</div>
+      <div class="field-grid">
+        <label>Durée de sommeil (heures)<input type="number" step="0.5" name="sleepDuration" min="0" max="24" placeholder="Ex: 7.5" /></label>
+        <label>Score de sommeil (0-100)<input type="number" name="sleepScore" min="0" max="100" placeholder="Ex: 78" /></label>
+      </div>
+
+      <div class="modal-section-title">💭 Bien-être</div>
+      <div class="field-grid">
+        <label>Humeur
+          <select name="mood">
+            <option value="">—</option>
+            <option value="5">Excellente</option>
+            <option value="4">Bonne</option>
+            <option value="3">Neutre</option>
+            <option value="2">Faible</option>
+            <option value="1">Mauvaise</option>
+          </select>
+        </label>
+        <label>Énergie
+          <select name="energy">
+            <option value="">—</option>
+            <option value="5">Très haute</option>
+            <option value="4">Haute</option>
+            <option value="3">Normale</option>
+            <option value="2">Basse</option>
+            <option value="1">Très basse</option>
+          </select>
+        </label>
+      </div>
+      <label>Notes<textarea name="notes" rows="2"></textarea></label>
+      <label>Photo de progression<input type="file" name="photo" accept="image/*" /></label>
+      <button type="submit" class="btn primary full">Enregistrer</button>
+    </form>
+  </div>
+</div>
+
+<!-- ===================== BMR MODAL ===================== -->
+<div id="bmr-modal" class="modal hidden">
+  <div class="modal-card" style="max-width:380px;">
+    <div class="modal-head">
+      <h2>Modifier le BMR</h2>
+      <button class="icon-btn" id="close-bmr">✕</button>
+    </div>
+    <form id="bmr-form" class="modal-form">
+      <label>Nouveau BMR de base (kcal/jour)
+        <input type="number" id="bmr-input" min="800" max="4000" required />
+      </label>
+      <p class="hint">Le BMR adapté sera recalculé automatiquement selon ton historique poids/calories.</p>
+      <button type="submit" class="btn primary full">Valider</button>
+    </form>
+  </div>
+</div>
+
+<!-- ===================== SYNC SETTINGS MODAL ===================== -->
+<div id="sync-settings-modal" class="modal hidden">
+  <div class="modal-card" style="max-width:440px;">
+    <div class="modal-head">
+      <h2>Synchronisation entre appareils</h2>
+      <button class="icon-btn" id="close-sync-settings">✕</button>
+    </div>
+    <form id="sync-settings-form" class="modal-form">
+      <p class="hint">Renseigne les mêmes identifiants JSONBin.io sur chacun de tes appareils pour qu'ils partagent les mêmes données. Crée un compte gratuit sur <strong>jsonbin.io</strong>, crée un "Bin", puis colle ta clé API et l'ID du Bin ci-dessous.</p>
+      <label>Clé API JSONBin (X-Master-Key)
+        <input type="text" id="sync-jsonbin-key" placeholder="$2a$10$..." autocomplete="off" />
+      </label>
+      <label>Bin ID
+        <input type="text" id="sync-jsonbin-id" placeholder="6...abc" autocomplete="off" />
+      </label>
+      <button type="submit" class="btn primary full">Enregistrer et synchroniser</button>
+    </form>
+  </div>
+</div>
+
+<!-- ===================== SPORT ACTIVITY TEMPLATE ===================== -->
+<template id="sport-activity-tpl">
+  <div class="sport-activity-row">
+    <input type="text" class="sport-name" placeholder="Nom de l'activité (ex: Course à pied)" />
+    <input type="number" class="sport-kcal" placeholder="Calories dépensées" min="0" />
+    <button type="button" class="sport-remove icon-btn">✕</button>
+  </div>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>
