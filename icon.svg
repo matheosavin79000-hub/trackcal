@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="100" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#11241D"/>
+      <stop offset="100%" stop-color="#0A1310"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="20" y1="80" x2="80" y2="18" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1F7A5C"/>
+      <stop offset="100%" stop-color="#4FE0A6"/>
+    </linearGradient>
+    <linearGradient id="leafShine" x1="50" y1="20" x2="50" y2="78" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="100" height="100" rx="24" fill="url(#bg)"/>
+  <rect x="1.5" y="1.5" width="97" height="97" rx="22.5" fill="none" stroke="#ffffff" stroke-opacity="0.06"/>
+
+  <!-- Abstract monogram: stylised ascending "M" fused with a leaf/pulse curve -->
+  <path d="M27 72 V32 C27 29 30 27 33 28.5 L50 38 L67 28.5 C70 27 73 29 73 32 V72"
+        fill="none" stroke="url(#leaf)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <path d="M27 72 V32 C27 29 30 27 33 28.5 L50 38 L67 28.5 C70 27 73 29 73 32 V72"
+        fill="none" stroke="url(#leafShine)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <circle cx="50" cy="38" r="4.4" fill="#0A1310"/>
+  <circle cx="50" cy="38" r="4.4" fill="none" stroke="url(#leaf)" stroke-width="2.4"/>
+
+  <!-- subtle metabolic pulse line beneath -->
+  <path d="M21 84 H37 L42 76 L48 90 L54 80 L60 84 H79"
+        fill="none" stroke="#3FCB91" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.55"/>
+</svg>
