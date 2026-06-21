@@ -9,7 +9,7 @@
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="icon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="style.css" />
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js" onerror="this.onerror=null;document.write('<script src=\'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js\'>\x3c/script>')"></script>
 </head>
 <body>
 
@@ -28,6 +28,18 @@
       <div id="pw-error" class="pw-error hidden">Mot de passe incorrect</div>
       <button class="btn primary full" id="pw-submit">Entrer</button>
     </div>
+  </div>
+</div>
+
+<!-- ===================== LOADING / RETRY ===================== -->
+<div id="screen-loading" class="screen hidden">
+  <div class="auth-card">
+    <div class="brand centered">
+      <img class="brand-mark" src="icon.svg" alt="Métabolyse" width="34" height="34" />
+      <span class="brand-name">Métabolyse</span>
+    </div>
+    <p class="auth-sub" id="loading-status">Récupération de vos données…</p>
+    <button class="btn primary full hidden" id="loading-retry">Réessayer</button>
   </div>
 </div>
 
